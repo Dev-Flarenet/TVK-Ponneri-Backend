@@ -1,4 +1,12 @@
 import os
+import sys
+from pathlib import Path
+
+# Ensure Backend directory is in Python path whether run from root or Backend/
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
@@ -23,6 +31,7 @@ app.add_middleware(
 
 from routers.aadhaar_router import router as aadhaar_router
 from routers.complaints_router import router as complaints_router
+
 from routers.admin_router import router as admin_router
 from routers.config_router import router as config_router
 from routers.news_router import router as news_router
