@@ -301,6 +301,7 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
     """
     clean_uid = "".join(filter(str.isdigit, str(uid)))
     clean_otp = "".join(filter(str.isdigit, str(otp)))
+    sid = session_id
 
     sess = oauth_sessions.get(session_id, {})
     if sess.get("proxied") or await _check_local_proxy():
