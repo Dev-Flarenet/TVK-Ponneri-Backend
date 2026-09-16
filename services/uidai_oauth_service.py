@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import asyncio
 import logging
+import json
 from datetime import datetime, date
 from typing import Dict, Any, Optional, Tuple
 
@@ -187,11 +188,30 @@ async def get_captcha(session_id: Optional[str] = None) -> Dict[str, Any]:
             raise Exception(f"UIDAI Captcha API returned HTTP {cap_resp.status_code}")
 
         cap_data = cap_resp.json()
-        captcha_b64 = cap_data.get("captchaBase64Image") or cap_data.get("imageBase64") or ""
-        if captcha_b64 and not captcha_b64.startswith("data:"):
-            captcha_b64 = f"data:image/jpeg;base64,{captcha_b64}"
+        captcha_b64 = ""
+        captcha_txn_id = ""
 
-        captcha_txn_id = cap_data.get("captchaTxnId") or cap_data.get("transactionId") or ""
+        # UIDAI Tathya returns {"message": "{\"imageBase64\":\"...\",\"transactionId\":\"...\"}", "sessionActive": true}
+        raw_msg = cap_data.get("message")
+        if raw_msg:
+            try:
+                msg_obj = json.loads(raw_msg) if isinstance(raw_msg, str) else raw_msg
+                if isinstance(msg_obj, dict):
+                    captcha_b64 = msg_obj.get("imageBase64") or msg_obj.get("captchaBase64Image") or ""
+                    captcha_txn_id = msg_obj.get("transactionId") or msg_obj.get("captchaTxnId") or ""
+            except Exception as e:
+                logger.warning(f"Error parsing inner captcha JSON string: {e}")
+
+        # Fallback to top-level keys if present
+        if not captcha_b64:
+            captcha_b64 = cap_data.get("captchaBase64Image") or cap_data.get("imageBase64") or ""
+        if not captcha_txn_id:
+            captcha_txn_id = cap_data.get("captchaTxnId") or cap_data.get("transactionId") or ""
+
+        if captcha_b64 and not captcha_b64.startswith("data:"):
+            # UIDAI captcha images are PNG format
+            mime = "image/png" if captcha_b64.startswith("iVBORw") else "image/jpeg"
+            captcha_b64 = f"data:{mime};base64,{captcha_b64}"
 
         oauth_sessions[sid] = {
             "session_id": sid,
