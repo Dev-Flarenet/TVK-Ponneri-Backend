@@ -105,6 +105,169 @@ def format_deduplicated_address(demo: Dict[str, Any], is_local: bool = False) ->
     return addr
 
 
+def decode_jwt_payload(token: str) -> Dict[str, Any]:
+    try:
+        if not token or not isinstance(token, str):
+            return {}
+        parts = token.split(".")
+        if len(parts) >= 2:
+            payload = parts[1]
+            padded = payload + "=" * (-len(payload) % 4)
+            data = base64.urlsafe_b64decode(padded)
+            return json.loads(data.decode("utf-8", errors="ignore"))
+    except Exception:
+        pass
+    return {}
+
+
+def _extract_field(sources: list, *keys, default="") -> Any:
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for k in keys:
+            val = src.get(k)
+            if val is not None and str(val).strip() not in ("", "-", "null", "None"):
+                return val
+    return default
+
+
+def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Dict[str, Any]) -> Dict[str, Any]:
+    # Collect all potential dictionaries where demographic fields could reside
+    sources = []
+
+    # 1. JWT Payload from access_token
+    access_token = token_data.get("access_token") or ""
+    if access_token:
+        jwt_claims = decode_jwt_payload(access_token)
+        if jwt_claims:
+            sources.append(jwt_claims)
+
+    # 2. JWT Payload from id_token (if present)
+    id_token = token_data.get("id_token") or ""
+    if id_token:
+        id_claims = decode_jwt_payload(id_token)
+        if id_claims:
+            sources.append(id_claims)
+
+    # 3. token_data root
+    sources.append(token_data)
+
+    # 4. raw_profile and its potential nested containers
+    if isinstance(raw_profile, dict):
+        sources.append(raw_profile)
+        for sub_key in ("demographicsInfo", "demographics", "data", "profile", "response", "identity", "kycData", "residentDetails"):
+            sub = raw_profile.get(sub_key)
+            if isinstance(sub, dict):
+                sources.append(sub)
+
+    # 5. Address sub-dictionaries
+    for src in list(sources):
+        for addr_key in ("address", "splitAddress", "residentAddress", "formattedAddress"):
+            sub_addr = src.get(addr_key) if isinstance(src, dict) else None
+            if isinstance(sub_addr, dict):
+                sources.append(sub_addr)
+
+    # Extract Fields
+    name = _extract_field(sources, "name", "user_name", "fullName", "resident_name", "citizen_name")
+    local_name = _extract_field(sources, "local_name", "tamil_name", "name_local", "localName", "l_name")
+
+    # Gender normalization
+    gender_raw = str(_extract_field(sources, "gender", "sex", default="")).strip().upper()
+    gender = "MALE" if gender_raw in ("M", "MALE") else "FEMALE" if gender_raw in ("F", "FEMALE") else "TRANSGENDER" if gender_raw in ("T", "TRANSGENDER") else gender_raw
+
+    # DOB & Age
+    dob = _extract_field(sources, "dob", "dateOfBirth", "date_of_birth", "birthDate", "birth_date", "yob")
+    age = calculate_age(dob) if dob else None
+
+    # Mobile
+    mobile = _extract_field(sources, "mobile", "mobileNumber", "mobile_number", "phone", "phoneNumber", "contactNumber", "phone_number")
+
+    # Email
+    email = _extract_field(sources, "email", "emailId", "email_id", "emailAddress")
+
+    # Care of
+    careof = _extract_field(sources, "careof", "careOf", "co", "c_o", "fatherName", "guardianName", "relativeName")
+    local_careof = _extract_field(sources, "local_careof", "localCareOf", "local_co")
+
+    # Pincode
+    pincode = str(_extract_field(sources, "pincode", "pinCode", "pin_code", "postalCode", "pc", "pin", default="")).strip()
+
+    # Photo URI
+    photo_raw = _extract_field(sources, "photo", "userPhoto", "image", "photoBase64", "profilePhoto", "residentPhoto", "pht")
+    photo_uri = ""
+    if photo_raw and isinstance(photo_raw, str) and len(photo_raw) > 50:
+        if photo_raw.startswith("data:"):
+            photo_uri = photo_raw
+        else:
+            mime = "image/png" if photo_raw.startswith("iVBORw") else "image/jpeg"
+            photo_uri = f"data:{mime};base64,{photo_raw}"
+
+    # Address Construction
+    addr_str = _extract_field(sources, "fullAddress", "formattedAddress", "residentAddress", "completeAddress")
+    if not addr_str:
+        for s in sources:
+            a = s.get("address") if isinstance(s, dict) else None
+            if isinstance(a, str) and len(a.strip()) > 5:
+                addr_str = a.strip()
+                break
+
+    if not addr_str:
+        co_part = _extract_field(sources, "careof", "careOf", "co", "c_o")
+        building = _extract_field(sources, "house", "building", "doorNo", "flatNo", "buildingName", "houseNumber")
+        street = _extract_field(sources, "street", "streetName", "road", "street_name")
+        landmark = _extract_field(sources, "landmark", "lm", "near")
+        locality = _extract_field(sources, "locality", "loc", "area")
+        vtc = _extract_field(sources, "vtcName", "vtc", "village", "city", "town")
+        po = _extract_field(sources, "poName", "po", "postOffice", "post_office")
+        subdist = _extract_field(sources, "subDistrictName", "subdist", "subDistrict", "taluk", "tahsil", "mandal")
+        dist = _extract_field(sources, "districtName", "district", "dist")
+        state = _extract_field(sources, "stateName", "state")
+
+        parts = []
+        for part in (co_part, building, street, landmark, locality, vtc, po, subdist, dist, state):
+            if part and isinstance(part, str):
+                p = part.strip()
+                if p and (not parts or parts[-1] != p):
+                    parts.append(p)
+        addr_str = ", ".join(parts)
+        if pincode and not addr_str.endswith(pincode):
+            addr_str = f"{addr_str} - {pincode}" if addr_str else pincode
+
+    # Local Tamil Address
+    local_addr_str = _extract_field(sources, "address_local", "local_address", "tamil_address")
+    if not local_addr_str:
+        local_parts = []
+        for lk in ("local_careof", "local_building", "local_street", "local_landmark", "local_locality", "local_vtcName", "local_poName", "local_subDistrictName", "local_districtName", "local_stateName"):
+            lv = _extract_field(sources, lk)
+            if lv and isinstance(lv, str):
+                lp = lv.strip()
+                if lp and (not local_parts or local_parts[-1] != lp):
+                    local_parts.append(lp)
+        local_addr_str = ", ".join(local_parts)
+        if pincode and local_addr_str and not local_addr_str.endswith(pincode):
+            local_addr_str = f"{local_addr_str} - {pincode}"
+
+    eid = _extract_field(sources, "eid", "enrollmentId")
+
+    return {
+        "uid": clean_uid,
+        "name": name,
+        "local_name": local_name,
+        "gender": gender,
+        "dob": dob,
+        "age": age,
+        "mobile": mobile,
+        "email": email,
+        "careof": careof,
+        "local_careof": local_careof,
+        "pincode": pincode,
+        "eid": eid,
+        "address": addr_str,
+        "address_local": local_addr_str,
+        "photo": photo_uri,
+    }
+
+
 _proxy_status_cache = {"active": False, "checked_at": 0.0}
 
 
@@ -428,31 +591,12 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
             return {"success": False, "message": "Failed to fetch demographic profile from UIDAI."}
 
         raw_profile = prof_resp.json()
-        demo = raw_profile.get("demographicsInfo") or raw_profile
+        logger.info(f"[{sid}] Tathya raw_profile json: {raw_profile}")
+        logger.info(f"[{sid}] Tathya token_data: {token_data}")
 
-        # 5. Build Enriched Citizen Profile
-        photo_raw = demo.get("photo") or ""
-        photo_uri = photo_raw if (not photo_raw or photo_raw.startswith("data:")) else f"data:image/jpeg;base64,{photo_raw}"
-        dob = demo.get("dob") or ""
-        age = calculate_age(dob)
-
-        profile = {
-            "uid": clean_uid,
-            "name": demo.get("name") or token_data.get("user_name", ""),
-            "local_name": demo.get("local_name") or demo.get("tamil_name") or "",
-            "gender": demo.get("gender") or "",
-            "dob": dob,
-            "age": age,
-            "mobile": demo.get("mobile") or "",
-            "email": demo.get("email") or "",
-            "careof": demo.get("careof") or "",
-            "local_careof": demo.get("local_careof") or "",
-            "pincode": demo.get("pincode") or "",
-            "eid": demo.get("eid") or "",
-            "address": format_deduplicated_address(demo, is_local=False),
-            "address_local": format_deduplicated_address(demo, is_local=True),
-            "photo": photo_uri,
-        }
+        # 5. Build Comprehensive Enriched Citizen Profile
+        profile = _build_profile_from_sources(clean_uid, raw_profile, token_data)
+        logger.info(f"[{sid}] Tathya extracted profile summary: name={profile.get('name')}, dob={profile.get('dob')}, gender={profile.get('gender')}, mobile={profile.get('mobile')}, photo_len={len(profile.get('photo') or '')}")
 
         return {
             "success": True,
