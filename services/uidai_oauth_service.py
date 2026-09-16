@@ -10,7 +10,10 @@ import json
 from datetime import datetime, date
 from typing import Dict, Any, Optional, Tuple
 
-from services.verhoeff import is_valid_aadhaar
+try:
+    from services.verhoeff import is_valid_aadhaar
+except ImportError:
+    from api.services.verhoeff import is_valid_aadhaar
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uidai_oauth_service")
@@ -106,6 +109,7 @@ def format_deduplicated_address(demo: Dict[str, Any], is_local: bool = False) ->
 
 
 def decode_jwt_payload(token: str) -> Dict[str, Any]:
+    """Safely decode unverified claims from a JWT token (access_token or id_token)."""
     try:
         if not token or not isinstance(token, str):
             return {}
@@ -121,6 +125,7 @@ def decode_jwt_payload(token: str) -> Dict[str, Any]:
 
 
 def _extract_field(sources: list, *keys, default="") -> Any:
+    """Extract first non-empty value matching any of the candidate keys across sources."""
     for src in sources:
         if not isinstance(src, dict):
             continue
@@ -132,27 +137,34 @@ def _extract_field(sources: list, *keys, default="") -> Any:
 
 
 def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Dict[str, Any]) -> Dict[str, Any]:
-    # Collect all potential dictionaries where demographic fields could reside
+    """
+    Synthesize complete demographic profile by harvesting data from:
+    1. Access Token JWT claims
+    2. ID Token JWT claims (if provided)
+    3. Token exchange response fields
+    4. Demographics endpoint response (demographicsInfo or root level)
+    5. Nested sub-dictionaries (data, profile, identity, etc.)
+    """
     sources = []
 
-    # 1. JWT Payload from access_token
+    # 1. JWT claims from access token
     access_token = token_data.get("access_token") or ""
     if access_token:
         jwt_claims = decode_jwt_payload(access_token)
         if jwt_claims:
             sources.append(jwt_claims)
 
-    # 2. JWT Payload from id_token (if present)
+    # 2. JWT claims from id token
     id_token = token_data.get("id_token") or ""
     if id_token:
         id_claims = decode_jwt_payload(id_token)
         if id_claims:
             sources.append(id_claims)
 
-    # 3. token_data root
+    # 3. Token data root
     sources.append(token_data)
 
-    # 4. raw_profile and its potential nested containers
+    # 4. Profile API data
     if isinstance(raw_profile, dict):
         sources.append(raw_profile)
         for sub_key in ("demographicsInfo", "demographics", "data", "profile", "response", "identity", "kycData", "residentDetails"):
@@ -160,39 +172,29 @@ def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Di
             if isinstance(sub, dict):
                 sources.append(sub)
 
-    # 5. Address sub-dictionaries
+    # Address sub-objects
     for src in list(sources):
         for addr_key in ("address", "splitAddress", "residentAddress", "formattedAddress"):
             sub_addr = src.get(addr_key) if isinstance(src, dict) else None
             if isinstance(sub_addr, dict):
                 sources.append(sub_addr)
 
-    # Extract Fields
+    # Demographic Fields
     name = _extract_field(sources, "name", "user_name", "fullName", "resident_name", "citizen_name")
     local_name = _extract_field(sources, "local_name", "tamil_name", "name_local", "localName", "l_name")
 
-    # Gender normalization
     gender_raw = str(_extract_field(sources, "gender", "sex", default="")).strip().upper()
     gender = "MALE" if gender_raw in ("M", "MALE") else "FEMALE" if gender_raw in ("F", "FEMALE") else "TRANSGENDER" if gender_raw in ("T", "TRANSGENDER") else gender_raw
 
-    # DOB & Age
     dob = _extract_field(sources, "dob", "dateOfBirth", "date_of_birth", "birthDate", "birth_date", "yob")
     age = calculate_age(dob) if dob else None
 
-    # Mobile
     mobile = _extract_field(sources, "mobile", "mobileNumber", "mobile_number", "phone", "phoneNumber", "contactNumber", "phone_number")
-
-    # Email
     email = _extract_field(sources, "email", "emailId", "email_id", "emailAddress")
-
-    # Care of
     careof = _extract_field(sources, "careof", "careOf", "co", "c_o", "fatherName", "guardianName", "relativeName")
     local_careof = _extract_field(sources, "local_careof", "localCareOf", "local_co")
-
-    # Pincode
     pincode = str(_extract_field(sources, "pincode", "pinCode", "pin_code", "postalCode", "pc", "pin", default="")).strip()
 
-    # Photo URI
     photo_raw = _extract_field(sources, "photo", "userPhoto", "image", "photoBase64", "profilePhoto", "residentPhoto", "pht")
     photo_uri = ""
     if photo_raw and isinstance(photo_raw, str) and len(photo_raw) > 50:
@@ -202,7 +204,7 @@ def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Di
             mime = "image/png" if photo_raw.startswith("iVBORw") else "image/jpeg"
             photo_uri = f"data:{mime};base64,{photo_raw}"
 
-    # Address Construction
+    # Standard English Address
     addr_str = _extract_field(sources, "fullAddress", "formattedAddress", "residentAddress", "completeAddress")
     if not addr_str:
         for s in sources:
@@ -233,7 +235,7 @@ def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Di
         if pincode and not addr_str.endswith(pincode):
             addr_str = f"{addr_str} - {pincode}" if addr_str else pincode
 
-    # Local Tamil Address
+    # Regional Tamil / Local Address
     local_addr_str = _extract_field(sources, "address_local", "local_address", "tamil_address")
     if not local_addr_str:
         local_parts = []
@@ -351,6 +353,7 @@ async def get_captcha(session_id: Optional[str] = None) -> Dict[str, Any]:
             raise Exception(f"UIDAI Captcha API returned HTTP {cap_resp.status_code}")
 
         cap_data = cap_resp.json()
+        logger.info(f"[{sid}] Tathya generateCaptcha raw response: {cap_data}")
         captcha_b64 = ""
         captcha_txn_id = ""
 
@@ -387,6 +390,8 @@ async def get_captcha(session_id: Optional[str] = None) -> Dict[str, Any]:
         }
 
         asyncio.create_task(_expire_session(sid))
+
+        logger.info(f"[{sid}] Successfully parsed captcha: txnId={captcha_txn_id}, img_len={len(captcha_b64)}")
 
         return {
             "success": True,
@@ -464,7 +469,6 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
     """
     clean_uid = "".join(filter(str.isdigit, str(uid)))
     clean_otp = "".join(filter(str.isdigit, str(otp)))
-    sid = session_id
 
     sess = oauth_sessions.get(session_id, {})
     if sess.get("proxied") or await _check_local_proxy():
@@ -477,7 +481,6 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
                     )
                     data = res.json()
                     if res.status_code == 200 and data.get("success") and data.get("profile"):
-                        # Enrich profile with age if not calculated
                         prof = data["profile"]
                         if "age" not in prof or prof["age"] is None:
                             prof["age"] = calculate_age(prof.get("dob"))
@@ -527,7 +530,7 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
             headers=headers,
         )
         login_data = login_resp.json() if login_resp.status_code == 200 else {}
-        logger.info(f"[{sid}] Tathya login response: status={login_resp.status_code}, data={login_data}")
+        logger.info(f"[{session_id}] Tathya login response: status={login_resp.status_code}, data={login_data}")
         if login_data.get("status") not in ("Y", "y", True) or not login_data.get("redirectURL"):
             return {
                 "success": False,
@@ -542,7 +545,7 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
         # 2. Follow Authorize Redirect to capture code
         redir_resp = await client.get(redirect_url, headers=headers)
         location = redir_resp.headers.get("location") or ""
-        logger.info(f"[{sid}] Tathya authorize redirect: status={redir_resp.status_code}, location={location}")
+        logger.info(f"[{session_id}] Tathya authorize redirect: status={redir_resp.status_code}, location={location}")
 
         auth_code = None
         if "code=" in location:
@@ -551,7 +554,7 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
             auth_code = str(redir_resp.url).split("code=")[1].split("&")[0]
 
         if not auth_code:
-            logger.error(f"[{sid}] Could not find code in location={location} or url={redir_resp.url}")
+            logger.error(f"[{session_id}] Could not find code in location={location} or url={redir_resp.url}")
             return {"success": False, "message": "Failed to obtain authorization code from UIDAI."}
 
         # 3. PKCE Token Exchange
@@ -567,9 +570,9 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
             "Content-Length": "0",
         }
         token_resp = await client.post(token_url, headers=token_headers)
-        logger.info(f"[{sid}] Tathya token exchange response: status={token_resp.status_code}")
+        logger.info(f"[{session_id}] Tathya token exchange response: status={token_resp.status_code}")
         if token_resp.status_code != 200:
-            logger.error(f"[{sid}] Token exchange failed: {token_resp.text[:300]}")
+            logger.error(f"[{session_id}] Token exchange failed: {token_resp.text[:300]}")
             return {"success": False, "message": f"Token exchange failed (HTTP {token_resp.status_code})"}
 
         token_data = token_resp.json()
@@ -585,18 +588,18 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
             "X-Request-ID": telemetry_id,
         }
         prof_resp = await client.post(profile_url, json={"uidNumber": clean_uid}, headers=prof_headers)
-        logger.info(f"[{sid}] Tathya profile fetch: status={prof_resp.status_code}")
+        logger.info(f"[{session_id}] Tathya profile fetch: status={prof_resp.status_code}")
         if prof_resp.status_code != 200:
-            logger.error(f"[{sid}] Profile fetch failed: {prof_resp.text[:300]}")
+            logger.error(f"[{session_id}] Profile fetch failed: {prof_resp.text[:300]}")
             return {"success": False, "message": "Failed to fetch demographic profile from UIDAI."}
 
         raw_profile = prof_resp.json()
-        logger.info(f"[{sid}] Tathya raw_profile json: {raw_profile}")
-        logger.info(f"[{sid}] Tathya token_data: {token_data}")
+        logger.info(f"[{session_id}] Tathya raw_profile json: {raw_profile}")
+        logger.info(f"[{session_id}] Tathya token_data: {token_data}")
 
         # 5. Build Comprehensive Enriched Citizen Profile
         profile = _build_profile_from_sources(clean_uid, raw_profile, token_data)
-        logger.info(f"[{sid}] Tathya extracted profile summary: name={profile.get('name')}, dob={profile.get('dob')}, gender={profile.get('gender')}, mobile={profile.get('mobile')}, photo_len={len(profile.get('photo') or '')}")
+        logger.info(f"[{session_id}] Tathya extracted profile summary: name={profile.get('name')}, dob={profile.get('dob')}, gender={profile.get('gender')}, mobile={profile.get('mobile')}, photo_len={len(profile.get('photo') or '')}")
 
         return {
             "success": True,

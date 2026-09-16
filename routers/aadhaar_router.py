@@ -129,7 +129,7 @@ async def init_session():
         # First attempt OAuth PKCE captcha for seamless interoperability
         try:
             oauth_res = await get_captcha()
-            if oauth_res.get("success"):
+            if oauth_res.get("success") and oauth_res.get("captchaImage"):
                 return {
                     "session_id": oauth_res.get("sessionId"),
                     "captcha_base64": oauth_res.get("captchaImage"),
