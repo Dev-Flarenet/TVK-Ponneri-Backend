@@ -363,21 +363,32 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
             headers=headers,
         )
         login_data = login_resp.json() if login_resp.status_code == 200 else {}
-        if login_data.get("status") != "Y" or not login_data.get("redirectURL"):
+        logger.info(f"[{sid}] Tathya login response: status={login_resp.status_code}, data={login_data}")
+        if login_data.get("status") not in ("Y", "y", True) or not login_data.get("redirectURL"):
             return {
                 "success": False,
                 "message": login_data.get("errorMessage") or "Invalid OTP or authentication failed.",
             }
 
         redirect_url = login_data["redirectURL"]
+        # CRITICAL FIX: UIDAI returns http:// but Tathya port 80 is firewalled/timed out. Force HTTPS!
+        if redirect_url.startswith("http://"):
+            redirect_url = redirect_url.replace("http://", "https://", 1)
 
         # 2. Follow Authorize Redirect to capture code
         redir_resp = await client.get(redirect_url, headers=headers)
         location = redir_resp.headers.get("location") or ""
-        if "code=" not in location:
-            return {"success": False, "message": "Failed to obtain authorization code from UIDAI."}
+        logger.info(f"[{sid}] Tathya authorize redirect: status={redir_resp.status_code}, location={location}")
 
-        auth_code = location.split("code=")[1].split("&")[0]
+        auth_code = None
+        if "code=" in location:
+            auth_code = location.split("code=")[1].split("&")[0]
+        elif "code=" in str(redir_resp.url):
+            auth_code = str(redir_resp.url).split("code=")[1].split("&")[0]
+
+        if not auth_code:
+            logger.error(f"[{sid}] Could not find code in location={location} or url={redir_resp.url}")
+            return {"success": False, "message": "Failed to obtain authorization code from UIDAI."}
 
         # 3. PKCE Token Exchange
         token_url = (
@@ -392,7 +403,9 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
             "Content-Length": "0",
         }
         token_resp = await client.post(token_url, headers=token_headers)
+        logger.info(f"[{sid}] Tathya token exchange response: status={token_resp.status_code}")
         if token_resp.status_code != 200:
+            logger.error(f"[{sid}] Token exchange failed: {token_resp.text[:300]}")
             return {"success": False, "message": f"Token exchange failed (HTTP {token_resp.status_code})"}
 
         token_data = token_resp.json()
@@ -408,7 +421,9 @@ async def login_and_get_profile(session_id: str, uid: str, otp: str) -> Dict[str
             "X-Request-ID": telemetry_id,
         }
         prof_resp = await client.post(profile_url, json={"uidNumber": clean_uid}, headers=prof_headers)
+        logger.info(f"[{sid}] Tathya profile fetch: status={prof_resp.status_code}")
         if prof_resp.status_code != 200:
+            logger.error(f"[{sid}] Profile fetch failed: {prof_resp.text[:300]}")
             return {"success": False, "message": "Failed to fetch demographic profile from UIDAI."}
 
         raw_profile = prof_resp.json()
