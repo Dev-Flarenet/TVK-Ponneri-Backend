@@ -136,14 +136,32 @@ def _extract_field(sources: list, *keys, default="") -> Any:
     return default
 
 
+def _collect_nested_dicts(obj, collected=None, seen=None):
+    if collected is None:
+        collected = []
+    if seen is None:
+        seen = set()
+    if isinstance(obj, dict):
+        obj_id = id(obj)
+        if obj_id not in seen:
+            seen.add(obj_id)
+            collected.append(obj)
+            for v in obj.values():
+                _collect_nested_dicts(v, collected, seen)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_nested_dicts(item, collected, seen)
+    return collected
+
+
 def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Synthesize complete demographic profile by harvesting data from:
     1. Access Token JWT claims
     2. ID Token JWT claims (if provided)
     3. Token exchange response fields
-    4. Demographics endpoint response (demographicsInfo or root level)
-    5. Nested sub-dictionaries (data, profile, identity, etc.)
+    4. Demographics endpoint response (demographicsInfo, residentDetails, or root level)
+    5. Recursively all nested sub-dictionaries
     """
     sources = []
 
@@ -164,38 +182,53 @@ def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Di
     # 3. Token data root
     sources.append(token_data)
 
-    # 4. Profile API data
-    if isinstance(raw_profile, dict):
-        sources.append(raw_profile)
-        for sub_key in ("demographicsInfo", "demographics", "data", "profile", "response", "identity", "kycData", "residentDetails"):
-            sub = raw_profile.get(sub_key)
-            if isinstance(sub, dict):
-                sources.append(sub)
+    # 4. Profile API data - harvest all nested dictionaries recursively
+    if raw_profile:
+        sources.extend(_collect_nested_dicts(raw_profile))
 
-    # Address sub-objects
-    for src in list(sources):
-        for addr_key in ("address", "splitAddress", "residentAddress", "formattedAddress"):
-            sub_addr = src.get(addr_key) if isinstance(src, dict) else None
-            if isinstance(sub_addr, dict):
-                sources.append(sub_addr)
+    # Diagnostic logging of all keys available in sources
+    all_keys = set()
+    for s in sources:
+        if isinstance(s, dict):
+            all_keys.update(s.keys())
+    logger.info(f"Harvested sources keys for {clean_uid}: {sorted(list(all_keys))}")
 
     # Demographic Fields
-    name = _extract_field(sources, "name", "user_name", "fullName", "resident_name", "citizen_name")
-    local_name = _extract_field(sources, "local_name", "tamil_name", "name_local", "localName", "l_name")
+    name = _extract_field(sources, "name", "user_name", "fullName", "resident_name", "citizen_name", "residentName")
+    local_name = _extract_field(sources, "localResName", "local_name", "tamil_name", "name_local", "localName", "l_name", "localResidentName")
 
     gender_raw = str(_extract_field(sources, "gender", "sex", default="")).strip().upper()
     gender = "MALE" if gender_raw in ("M", "MALE") else "FEMALE" if gender_raw in ("F", "FEMALE") else "TRANSGENDER" if gender_raw in ("T", "TRANSGENDER") else gender_raw
 
-    dob = _extract_field(sources, "dob", "dateOfBirth", "date_of_birth", "birthDate", "birth_date", "yob")
+    dob = _extract_field(sources, "dob", "dateOfBirth", "date_of_birth", "birthDate", "birth_date", "yob", "yearOfBirth")
     age = calculate_age(dob) if dob else None
 
     mobile = _extract_field(sources, "mobile", "mobileNumber", "mobile_number", "phone", "phoneNumber", "contactNumber", "phone_number")
     email = _extract_field(sources, "email", "emailId", "email_id", "emailAddress")
     careof = _extract_field(sources, "careof", "careOf", "co", "c_o", "fatherName", "guardianName", "relativeName")
-    local_careof = _extract_field(sources, "local_careof", "localCareOf", "local_co")
+    local_careof = _extract_field(sources, "localCareof", "local_careof", "localCareOf", "local_co")
     pincode = str(_extract_field(sources, "pincode", "pinCode", "pin_code", "postalCode", "pc", "pin", default="")).strip()
 
-    photo_raw = _extract_field(sources, "photo", "userPhoto", "image", "photoBase64", "profilePhoto", "residentPhoto", "pht")
+    # Photo Extraction - try named keys first, then inspect base64 signatures
+    photo_raw = _extract_field(
+        sources,
+        "photo", "userPhoto", "image", "photoBase64", "profilePhoto",
+        "residentPhoto", "pht", "faceImage", "resident_photo", "photoData",
+        "picture", "photo_base64", "residentImage", "img"
+    )
+    if not photo_raw:
+        for s in sources:
+            if isinstance(s, dict):
+                for k, v in s.items():
+                    if isinstance(v, str) and len(v) > 200:
+                        clean_v = v.strip()
+                        if clean_v.startswith("/9j/") or clean_v.startswith("iVBORw") or clean_v.startswith("data:image"):
+                            photo_raw = clean_v
+                            logger.info(f"Discovered base64 photo under key: '{k}' (len={len(clean_v)})")
+                            break
+            if photo_raw:
+                break
+
     photo_uri = ""
     if photo_raw and isinstance(photo_raw, str) and len(photo_raw) > 50:
         if photo_raw.startswith("data:"):
@@ -204,7 +237,7 @@ def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Di
             mime = "image/png" if photo_raw.startswith("iVBORw") else "image/jpeg"
             photo_uri = f"data:{mime};base64,{photo_raw}"
 
-    # Standard English Address
+    # English Address Construction
     addr_str = _extract_field(sources, "fullAddress", "formattedAddress", "residentAddress", "completeAddress")
     if not addr_str:
         for s in sources:
@@ -214,37 +247,51 @@ def _build_profile_from_sources(clean_uid: str, raw_profile: Any, token_data: Di
                 break
 
     if not addr_str:
-        co_part = _extract_field(sources, "careof", "careOf", "co", "c_o")
-        building = _extract_field(sources, "house", "building", "doorNo", "flatNo", "buildingName", "houseNumber")
+        parts = []
+        building = _extract_field(sources, "building", "house", "doorNo", "flatNo", "buildingName", "houseNumber")
         street = _extract_field(sources, "street", "streetName", "road", "street_name")
         landmark = _extract_field(sources, "landmark", "lm", "near")
         locality = _extract_field(sources, "locality", "loc", "area")
-        vtc = _extract_field(sources, "vtcName", "vtc", "village", "city", "town")
-        po = _extract_field(sources, "poName", "po", "postOffice", "post_office")
-        subdist = _extract_field(sources, "subDistrictName", "subdist", "subDistrict", "taluk", "tahsil", "mandal")
-        dist = _extract_field(sources, "districtName", "district", "dist")
-        state = _extract_field(sources, "stateName", "state")
 
-        parts = []
-        for part in (co_part, building, street, landmark, locality, vtc, po, subdist, dist, state):
+        for part in (building, street, landmark, locality):
             if part and isinstance(part, str):
                 p = part.strip()
                 if p and (not parts or parts[-1] != p):
                     parts.append(p)
+
+        for k in ("poName", "vtcName", "subDistrictName", "districtName", "stateName"):
+            val = _extract_field(sources, k)
+            if val and isinstance(val, str):
+                p = val.strip()
+                if p and (not parts or parts[-1] != p):
+                    parts.append(p)
+
         addr_str = ", ".join(parts)
         if pincode and not addr_str.endswith(pincode):
             addr_str = f"{addr_str} - {pincode}" if addr_str else pincode
 
-    # Regional Tamil / Local Address
+    # Regional Tamil / Local Address Construction
     local_addr_str = _extract_field(sources, "address_local", "local_address", "tamil_address")
     if not local_addr_str:
         local_parts = []
-        for lk in ("local_careof", "local_building", "local_street", "local_landmark", "local_locality", "local_vtcName", "local_poName", "local_subDistrictName", "local_districtName", "local_stateName"):
-            lv = _extract_field(sources, lk)
-            if lv and isinstance(lv, str):
-                lp = lv.strip()
+        lb = _extract_field(sources, "localBuilding", "local_building", "localHouse")
+        lst = _extract_field(sources, "localStreet", "local_street")
+        llm = _extract_field(sources, "localLandmark", "local_landmark")
+        lloc = _extract_field(sources, "localLocality", "local_locality")
+
+        for part in (lb, lst, llm, lloc):
+            if part and isinstance(part, str):
+                lp = part.strip()
                 if lp and (not local_parts or local_parts[-1] != lp):
                     local_parts.append(lp)
+
+        for k in ("poNameLocal", "localVtc", "local_vtcName", "subDistrictLocalName", "localDistrict", "localState"):
+            val = _extract_field(sources, k)
+            if val and isinstance(val, str):
+                lp = val.strip()
+                if lp and (not local_parts or local_parts[-1] != lp):
+                    local_parts.append(lp)
+
         local_addr_str = ", ".join(local_parts)
         if pincode and local_addr_str and not local_addr_str.endswith(pincode):
             local_addr_str = f"{local_addr_str} - {pincode}"
